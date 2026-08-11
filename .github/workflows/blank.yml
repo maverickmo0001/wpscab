@@ -17,35 +17,67 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_BOT_TOKEN }}
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Tools
+      - name: Install WPScan Dynamically
         run: |
-          # Install WPScan using the official pre-compiled .deb package
-          wget -q https://github.com/wpscanteam/wpscan/releases/download/v3.8.22/wpscan_3.8.22-1_amd64.deb -O wpscan.deb
-          sudo dpkg -i wpscan.deb 2>/dev/null || sudo apt-get -f install -y > /dev/null 2>&1
-          rm -f wpscan.deb
+          # Fallback installation variable
+          export WPSCAN_PATH="wpscan"
+          
+          # 1. Try to dynamically fetch the absolute latest version number from GitHub API
+          LATEST_TAG=$(curl -s https://api.github.com/repos/wpscanteam/wpscan/releases/latest | jq -r '.tag_name')
+          
+          if [ -n "$LATEST_TAG" ]; then
+            echo "[INFO] Found latest WPScan version: $LATEST_TAG"
+            # Construct the URL based on the dynamic tag
+            wget -q "https://github.com/wpscanteam/wpscan/releases/download/$LATEST_TAG/wpscan_${LATEST_TAG}_linux_amd64.deb" -O wpscan.deb 2>/dev/null
+            
+            # If download succeeded, install it
+            if [ -f "wpscan.deb" ] && [ -s "wpscan.deb" ]; then
+              sudo dpkg -i wpscan.deb 2>/dev/null
+              rm -f wpscan.deb
+              echo "[SUCCESS] WPScan installed via .deb package"
+            else
+              echo "[WARN] Direct .deb download failed (IP block or missing asset). Using fallback method..."
+              export WPSCAN_PATH="wpscan"
+            fi
+          else
+            echo "[WARN] Failed to fetch latest version from GitHub. Using fallback method..."
+            export WPSCAN_PATH="wpscan"
+          fi
+          
+          # 2. Fallback: Install via RubyGems (This is natively supported on GitHub runners and NEVER breaks)
+          if [ "$WPSCAN_PATH" = "wpscan" ]; then
+            echo "[INFO] Installing WPScan via RubyGems (100% reliable fallback)..."
+            # GitHub runners already have Ruby pre-installed
+            gem install wpscan > /dev/null 2>&1
+            WPSCAN_PATH="$(gem environment gem which wpscan)"
+          fi
           
           # Install Recon tools
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest > /dev/null 2>&1
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest > /dev/null 2>&1
           echo "$HOME/go/bin" >> $GITHUB_PATH
+          
+          # Verify WPScan is finally accessible
+          if ! command -v "$WPSCAN_PATH" &> /dev/null; then
+            echo "ERROR: WPScan installation completely failed."
+            exit 1
+          fi
 
       - name: Setup API Keys & Rotation Script
         run: |
-          # Dynamically build the API key list
           touch api_keys.txt
           [ -n "${{ secrets.WPSCAN_API_KEY_1 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_1 }}" >> api_keys.txt
           [ -n "${{ secrets.WPSCAN_API_KEY_2 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_2 }}" >> api_keys.txt
-          [ -n "${{ secrets.WPSCAN_API_KEY_3 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_3 }}" >> api_keys.txt
+          [ - -n "${{ secrets.WPSCAN_API_KEY_3 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_3 }}" >> api_keys.txt
           [ -n "${{ secrets.WPSCAN_API_KEY_4 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_4 }}" >> api_keys.txt
           [ -n "${{ secrets.WPSCAN_API_KEY_5 }}" ] && echo "${{ secrets.WPSCAN_API_KEY_5 }}" >> api_keys.txt
           
-          # Create the rotation bash script safely
           cat << 'EOF' > run_wpscan.sh
           #!/bin/bash
           URL="$1"
@@ -55,7 +87,7 @@ jobs:
           MAX_RETRIES=5
           while [ $MAX_RETRIES -gt 0 ]; do
             API_KEY=$(head -n 1 api_keys.txt 2>/dev/null)
-            CMD="wpscan --url $URL $ARGS --random-user-agent --disable-tls-checks -o $OUT_FILE"
+            CMD="$WPSCAN_PATH --url $URL $ARGS --random-user-agent --disable-tls-checks -o $OUT_FILE"
             
             if [ -n "$API_KEY" ]; then
               CMD="$CMD --api-token $API_KEY"
@@ -63,10 +95,8 @@ jobs:
             
             eval $CMD 2>wpscan_error.log
             
-            # Check if WPScan hit a rate limit
             if grep -qi "error.*429\|rate limit\|too many requests" wpscan_error.log; then
               echo "[!] Rate limit hit on key ending in ...${API_KEY: -4}. Rotating..." >> $OUT_FILE
-              # Remove the burned key from the list
               sed -i '1d' api_keys.txt
               touch api_keys.txt
               
@@ -75,7 +105,6 @@ jobs:
                 break
               fi
             else
-              # Success or other error (not rate limit), break loop
               break
             fi
             MAX_RETRIES=$((MAX_RETRIES - 1))
@@ -93,7 +122,6 @@ jobs:
         run: |
           touch wp_targets.txt
           
-          # Handle Direct URL input
           if [ -n "${{ github.event.inputs.direct_url }}" ]; then
             URL="${{ github.event.inputs.direct_url }}"
             if [[ ! "$URL" =~ ^https?:// ]]; then
@@ -102,7 +130,6 @@ jobs:
             echo "$URL" >> wp_targets.txt
           fi
           
-          # Handle Domains input
           if [ -n "${{ github.event.inputs.domains }}" ]; then
             echo "${{ github.event.inputs.domains }}" | tr '/' '\n' | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > enum_domains.txt
             
@@ -135,7 +162,6 @@ jobs:
               -d chat_id="${TELEGRAM_CHAT_ID}" \
               --data-urlencode "text=🚀 Scanning: ${target}" || true
             
-            # 1. Users
             ./run_wpscan.sh "$target" "--enumerate u" "${safe}_1_users.txt"
             if [ -s "${safe}_1_users.txt" ]; then
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
@@ -144,7 +170,6 @@ jobs:
                 -F caption="👤 [1/6] Users Found - ${target}" || true
             fi
             
-            # 2. Brute Force
             ./run_wpscan.sh "$target" "--enumerate bf" "${safe}_2_bf.txt"
             if [ -s "${safe}_2_bf.txt" ]; then
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
@@ -153,7 +178,6 @@ jobs:
                 -F caption="🔐 [2/6] Brute Force Results - ${target}" || true
             fi
             
-            # 3. Vulnerable Themes
             ./run_wpscan.sh "$target" "--enumerate vt" "${safe}_3_vuln_themes.txt"
             if [ -s "${safe}_3_vuln_themes.txt" ]; then
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
@@ -162,7 +186,6 @@ jobs:
                 -F caption="🎨 [3/6] VULNERABLE Themes Found! - ${target}" || true
             fi
             
-            # 4. Vulnerable Plugins
             ./run_wpscan.sh "$target" "--enumerate vp" "${safe}_4_vuln_plugins.txt"
             if [ -s "${safe}_4_vuln_plugins.txt" ]; then
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
@@ -171,7 +194,6 @@ jobs:
                 -F caption="🔌 [4/6] VULNERABLE Plugins Found! - ${target}" || true
             fi
             
-            # 5. All Themes (Slow)
             ./run_wpscan.sh "$target" "--enumerate at" "${safe}_5_all_themes.txt"
             if [ -s "${safe}_5_all_themes.txt" ]; then
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
@@ -180,7 +202,6 @@ jobs:
                 -F caption="📖 [5/6] All Themes Enumerated - ${target}" || true
             fi
             
-            # 6. All Plugins (Slowest)
             ./run_wpscan.sh "$target" "--enumerate ap" "${safe}_6_all_plugins.txt"
             if [ -s "${safe}_6_all_plugins.txt" ]; then
               curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
